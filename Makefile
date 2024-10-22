@@ -155,11 +155,6 @@ UPROGS=\
 	$U/_find\
 	$U/_xargs\
 
-ifeq ($(LAB),syscall)
-UPROGS += \
-	$U/_trace\
-	$U/_sysinfotest
-endif
 
 ifeq ($(LAB),trap)
 UPROGS += \
