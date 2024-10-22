@@ -23,12 +23,34 @@ struct {
   struct run *freelist;
 } kmem;
 
+
+void freebytes(uint64* dst)
+{
+  *dst=0;
+  struct run* p=kmem.freelist;
+
+  acquire(&kmem.lock);
+  while(p)
+  {
+    *dst+=PGSIZE;
+    p=p->next;
+  }
+  release(&kmem.lock);
+}
+
+
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
   freerange(end, (void*)PHYSTOP);
 }
+
+
+
+
+
 
 void
 freerange(void *pa_start, void *pa_end)
