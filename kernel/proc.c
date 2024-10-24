@@ -18,9 +18,12 @@ struct spinlock pid_lock;
 extern void forkret(void);
 static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
-
+extern void uvmmap(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm);
+extern pte_t *walk(pagetable_t pagetable, uint64 va, int alloc);
 extern char trampoline[]; // trampoline.S
 
+void
+u2kvmcopy(pagetable_t pagetable, pagetable_t kernelpt, uint64 oldsz, uint64 newsz);
 // initialize the proc table at boot time.
 void
 procinit(void)
@@ -30,16 +33,8 @@ procinit(void)
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
-
-      // Allocate a page for the process's kernel stack.
-      // Map it high in memory, followed by an invalid
-      // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+    
+      
   }
   kvminithart();
 }
@@ -102,6 +97,7 @@ allocproc(void)
       release(&p->lock);
     }
   }
+ 
   return 0;
 
 found:
@@ -113,13 +109,32 @@ found:
     return 0;
   }
 
-  // An empty user page table.
-  p->pagetable = proc_pagetable(p);
-  if(p->pagetable == 0){
-    freeproc(p);
-    release(&p->lock);
-    return 0;
-  }
+ // An empty user page table.
+p->pagetable = proc_pagetable(p);
+if(p->pagetable == 0){
+  freeproc(p);
+  release(&p->lock);
+  return 0;
+}
+
+// Init the kernal page table
+p->kernelpt = proc_kpt_init();
+if(p->kernelpt == 0){
+  freeproc(p);
+  release(&p->lock);
+  return 0;
+}
+
+ // Allocate a page for the process's kernel stack.
+      // Map it high in memory, followed by an invalid
+      // guard page.
+      char *pa = kalloc();
+      if(pa == 0)
+        panic("kalloc");
+      uint64 va = KSTACK((int) (p - proc));
+      uvmmap(p->kernelpt, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      p->kstack = va;
+
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
@@ -149,9 +164,31 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+
+  uvmunmap(p->kernelpt, p->kstack, 1, 1);
+  p->kstack = 0;
   p->state = UNUSED;
+
+  
 }
 
+void
+proc_freekernelpt(pagetable_t kernelpt)
+{
+  // similar to the freewalk method
+  // there are 2^9 = 512 PTEs in a page table.
+  for(int i = 0; i < 512; i++){
+    pte_t pte = kernelpt[i];
+    if(pte & PTE_V){
+      kernelpt[i] = 0;
+      if ((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+        uint64 child = PTE2PA(pte);
+        proc_freekernelpt((pagetable_t)child);
+      }
+    }
+  }
+  kfree((void*)kernelpt);
+}
 // Create a user page table for a given process,
 // with no user memory, but with trampoline pages.
 pagetable_t
@@ -243,9 +280,14 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    if (PGROUNDUP(sz + n) >= PLIC){
+      return -1;
+    }
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    // 复制一份到内核页表
+    u2kvmcopy(p->pagetable, p->kernelpt, sz - n, sz);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
@@ -274,6 +316,9 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+ // 复制到新进程的内核页表
+  u2kvmcopy(np->pagetable, np->kernelpt, 0, np->sz);
 
   np->parent = p;
 
@@ -460,10 +505,12 @@ scheduler(void)
   struct cpu *c = mycpu();
   
   c->proc = 0;
+  
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
     
+
     int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
@@ -472,8 +519,15 @@ scheduler(void)
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+c->proc = p;
+
+// Store the kernal page table into the SATP
+proc_inithart(p->kernelpt);
+
+swtch(&c->context, &p->context);
+
+// Come back to the global kernel page table
+kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
@@ -482,7 +536,8 @@ scheduler(void)
         found = 1;
       }
       release(&p->lock);
-    }
+  }
+
 #if !defined (LAB_FS)
     if(found == 0) {
       intr_on();
@@ -492,7 +547,10 @@ scheduler(void)
     ;
 #endif
   }
+  
 }
+
+
 
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
@@ -695,5 +753,21 @@ procdump(void)
       state = "???";
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
+  }
+}
+
+
+void
+u2kvmcopy(pagetable_t pagetable, pagetable_t kernelpt, uint64 oldsz, uint64 newsz){
+  pte_t *pte_from, *pte_to;
+  oldsz = PGROUNDUP(oldsz);
+  for (uint64 i = oldsz; i < newsz; i += PGSIZE){
+    if((pte_from = walk(pagetable, i, 0)) == 0)
+      panic("u2kvmcopy: src pte does not exist");
+    if((pte_to = walk(kernelpt, i, 1)) == 0)
+      panic("u2kvmcopy: pte walk failed");
+    uint64 pa = PTE2PA(*pte_from);
+    uint flags = (PTE_FLAGS(*pte_from)) & (~PTE_U);
+    *pte_to = PA2PTE(pa) | flags;
   }
 }
